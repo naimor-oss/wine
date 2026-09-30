@@ -3937,6 +3937,31 @@ static void test_PASSWORDCHAR(void)
     DestroyWindow (hwEdit);
 }
 
+static void test_capture(void)
+{
+    HWND hwnd;
+
+    hwnd = create_editcontrol(ES_AUTOHSCROLL, 0);
+
+    /* A click captures the mouse until the button is released. */
+    SendMessageA(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(1, 1));
+    ok(GetCapture() == hwnd, "Unexpected capture window %p.\n", GetCapture());
+    SendMessageA(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(1, 1));
+    ok(!GetCapture(), "Unexpected capture window %p.\n", GetCapture());
+
+    /* The control already has the capture when the click arrives. Its own
+     * SetCapture() then sends it WM_CAPTURECHANGED naming itself, which must
+     * not stop it from releasing the capture on button up. */
+    SetCapture(hwnd);
+    SendMessageA(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(1, 1));
+    ok(GetCapture() == hwnd, "Unexpected capture window %p.\n", GetCapture());
+    SendMessageA(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(1, 1));
+    todo_wine ok(!GetCapture(), "Unexpected capture window %p.\n", GetCapture());
+
+    ReleaseCapture();
+    DestroyWindow(hwnd);
+}
+
 START_TEST(edit)
 {
     ULONG_PTR ctx_cookie;
@@ -3988,6 +4013,7 @@ START_TEST(edit)
     test_ime();
     test_format_rect();
     test_PASSWORDCHAR();
+    test_capture();
 
     UnregisterWindowClasses();
 
