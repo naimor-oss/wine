@@ -3537,7 +3537,7 @@ static void test_capture(void)
     SendMessageA(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(1, 1));
     ok(GetCapture() == hwnd, "Unexpected capture window %p.\n", GetCapture());
     SendMessageA(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(1, 1));
-    todo_wine ok(!GetCapture(), "Unexpected capture window %p.\n", GetCapture());
+    ok(!GetCapture(), "Unexpected capture window %p.\n", GetCapture());
 
     ReleaseCapture();
     DestroyWindow(hwnd);

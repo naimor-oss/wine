@@ -5070,7 +5070,8 @@ LRESULT EditWndProc_common( HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, B
 		break;
 
         case WM_CAPTURECHANGED:
-            es->bCaptureState = FALSE;
+            if ((HWND)lParam != hwnd)
+                es->bCaptureState = FALSE;
             break;
 
         case WM_MOUSEWHEEL:
