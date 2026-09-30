@@ -4920,7 +4920,8 @@ static LRESULT CALLBACK EDIT_WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         break;
 
     case WM_CAPTURECHANGED:
-        es->bCaptureState = FALSE;
+        if ((HWND)lParam != hwnd)
+            es->bCaptureState = FALSE;
         break;
 
     case WM_MOUSEWHEEL:
