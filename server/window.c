@@ -319,6 +319,7 @@ static void map_point_raw_to_virt( struct desktop *desktop, int *x, int *y )
     height_to = monitor->virt.bottom - monitor->virt.top;
     width_from = monitor->raw.right - monitor->raw.left;
     height_from = monitor->raw.bottom - monitor->raw.top;
+    if (width_from <= 0 || height_from <= 0) return;
 
     *x = *x * 2 - (monitor->raw.left * 2 + width_from);
     *x = (*x * width_to * 2 + width_from) / (width_from * 2);
