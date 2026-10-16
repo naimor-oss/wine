@@ -152,6 +152,7 @@ struct fd
     WCHAR               *nt_name;     /* NT file name */
     data_size_t          nt_namelen;  /* length of NT file name */
     int                  unix_fd;     /* unix file descriptor */
+    int                  share_fd;    /* read-only unix fd holding this open's share mode for other servers, or -1 */
     unsigned int         no_fd_status;/* status to return when unix_fd is -1 */
     unsigned int         cacheable :1;/* can the fd be cached on the client side? */
     unsigned int         fs_locks :1; /* can we use filesystem locks for this fd? */
@@ -167,6 +168,7 @@ struct fd
 static void fd_dump( struct object *obj, int verbose );
 static struct object *fd_get_sync( struct object *obj );
 static void fd_destroy( struct object *obj );
+static void release_share_locks( struct fd *fd );
 
 static const struct object_ops fd_ops =
 {
@@ -1597,6 +1599,7 @@ static void fd_destroy( struct object *obj )
     if (fd->map_addr) free_map_addr( fd->map_addr, fd->map_size );
     if (fd->completion) release_object( fd->completion );
     remove_fd_locks( fd );
+    release_share_locks( fd );
     list_remove( &fd->inode_entry );
     if (fd->poll_index != -1) remove_poll_user( fd, fd->poll_index );
     free( fd->nt_name );
@@ -1658,6 +1661,118 @@ static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned 
     return 0;
 }
 
+/* Share modes across wineservers.
+ *
+ * check_sharing() sees only the opens made through this wineserver. Programs
+ * using the same files through another wineserver (one per container, for
+ * instance) get no sharing violations from each other, though Windows programs
+ * rely on them: to find out whether anyone else has a file open, to keep others
+ * out while they rebuild or delete a file. So each open also records its access,
+ * and the access it denies, as shared OFD locks on reserved bytes far past any
+ * file data, held on a read-only descriptor of its own; an open made through any
+ * server first tests those bytes for a conflict. OFD locks belong to the open
+ * file description, so they work between processes, and across a shared
+ * filesystem as far as its locks do.
+ *
+ * Not atomic across servers: two opens racing in different servers can both
+ * succeed. Without OFD locks (or on a filesystem without locks) nothing changes. */
+#ifdef F_OFD_SETLK
+
+#define SHARE_LOCK_BASE 0x7fffffff00000000ll
+
+enum share_byte { SB_READ, SB_WRITE, SB_DELETE, SB_DENY_READ, SB_DENY_WRITE, SB_DENY_DELETE, SB_COUNT };
+
+/* F_OFD_GETLK: 1 if another open file description holds a lock on the byte,
+ * 0 if not, -1 on error; F_OFD_SETLK: 0 or -1 */
+static int share_lock( int unix_fd, int byte, short type, int cmd )
+{
+    struct flock fl;
+
+    memset( &fl, 0, sizeof(fl) );
+    fl.l_type   = type;
+    fl.l_whence = SEEK_SET;
+    fl.l_start  = SHARE_LOCK_BASE + byte;
+    fl.l_len    = 1;
+    if (fcntl( unix_fd, cmd, &fl ) == -1) return -1;
+    return cmd == F_OFD_GETLK ? fl.l_type != F_UNLCK : 0;
+}
+
+static void release_share_locks( struct fd *fd )
+{
+    struct closed_fd *closed;
+    int i;
+
+    if (fd->share_fd == -1) return;
+    for (i = 0; i < SB_COUNT; i++) share_lock( fd->share_fd, i, F_UNLCK, F_OFD_SETLK );
+    /* closing it now would also drop this server's POSIX locks on the file */
+    if (fd->inode && (closed = mem_alloc( sizeof(*closed) )))
+    {
+        closed->unix_fd    = fd->share_fd;
+        closed->disp_flags = 0;
+        closed->unix_name  = NULL;
+        inode_add_closed_fd( fd->inode, closed );
+    }
+    else close( fd->share_fd );
+    fd->share_fd = -1;
+}
+
+static unsigned int check_sharing_across_servers( struct fd *fd, unsigned int access, unsigned int sharing )
+{
+    const unsigned int read_access = FILE_READ_DATA | FILE_EXECUTE;
+    const unsigned int write_access = FILE_WRITE_DATA | FILE_APPEND_DATA;
+    static const int pairs[3][2] = { { SB_READ, SB_DENY_READ }, { SB_WRITE, SB_DENY_WRITE },
+                                     { SB_DELETE, SB_DENY_DELETE } };
+    int want[SB_COUNT], i, held;
+    char path[32];
+    struct stat st;
+
+    if (!(access & (read_access | write_access | DELETE))) return 0;  /* sharing mode is ignored */
+    if (!fd->fs_locks || !fd->inode || fd->unix_fd == -1) return 0;
+    if (fstat( fd->unix_fd, &st ) == -1 || !S_ISREG( st.st_mode )) return 0;
+
+    snprintf( path, sizeof(path), "/proc/self/fd/%d", fd->unix_fd );
+    if ((fd->share_fd = open( path, O_RDONLY | O_CLOEXEC )) == -1 &&
+        (!fd->unix_name || (fd->share_fd = open( fd->unix_name, O_RDONLY | O_CLOEXEC )) == -1))
+        return 0;  /* can't read it: this open isn't seen by other servers */
+
+    want[SB_READ]        = !!(access & read_access);
+    want[SB_WRITE]       = !!(access & write_access);
+    want[SB_DELETE]      = !!(access & DELETE);
+    want[SB_DENY_READ]   = !(sharing & FILE_SHARE_READ);
+    want[SB_DENY_WRITE]  = !(sharing & FILE_SHARE_WRITE);
+    want[SB_DENY_DELETE] = !(sharing & FILE_SHARE_DELETE);
+
+    for (i = 0; i < 3; i++)
+    {
+        /* our access against their denials, our denials against their access */
+        if (want[pairs[i][0]] && (held = share_lock( fd->share_fd, pairs[i][1], F_WRLCK, F_OFD_GETLK )))
+            goto conflict;
+        if (want[pairs[i][1]] && (held = share_lock( fd->share_fd, pairs[i][0], F_WRLCK, F_OFD_GETLK )))
+            goto conflict;
+    }
+    for (i = 0; i < SB_COUNT; i++)
+        if (want[i] && share_lock( fd->share_fd, i, F_RDLCK, F_OFD_SETLK ) == -1)
+        {
+            release_share_locks( fd );  /* no OFD locks here: behave as before */
+            return 0;
+        }
+    return 0;
+
+conflict:
+    release_share_locks( fd );
+    return held > 0 ? STATUS_SHARING_VIOLATION : 0;
+}
+
+#else  /* F_OFD_SETLK */
+
+static void release_share_locks( struct fd *fd ) { }
+static unsigned int check_sharing_across_servers( struct fd *fd, unsigned int access, unsigned int sharing )
+{
+    return 0;
+}
+
+#endif  /* F_OFD_SETLK */
+
 /* set the events that select waits for on this fd */
 void set_fd_events( struct fd *fd, int events )
 {
@@ -1718,6 +1833,7 @@ static struct fd *alloc_fd_object(void)
     fd->options    = 0;
     fd->sharing    = 0;
     fd->unix_fd    = -1;
+    fd->share_fd   = -1;
     fd->unix_name  = NULL;
     fd->nt_name    = NULL;
     fd->nt_namelen = 0;
@@ -1763,6 +1879,7 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *use
     fd->nt_name    = NULL;
     fd->nt_namelen = 0;
     fd->unix_fd    = -1;
+    fd->share_fd   = -1;
     fd->cacheable  = 0;
     fd->fs_locks   = 0;
     fd->poll_index = -1;
@@ -1821,7 +1938,8 @@ struct fd *dup_fd_object( struct fd *orig, unsigned int access, unsigned int sha
         fd->closed = closed;
         fd->inode = (struct inode *)grab_object( orig->inode );
         list_add_head( &fd->inode->open, &fd->inode_entry );
-        if ((err = check_sharing( fd, access, sharing, 0, options )))
+        if ((err = check_sharing( fd, access, sharing, 0, options )) ||
+            (err = check_sharing_across_servers( fd, access, sharing )))
         {
             set_error( err );
             goto failed;
@@ -2039,7 +2157,8 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
             set_error( STATUS_FILE_IS_A_DIRECTORY );
             goto error;
         }
-        if ((err = check_sharing( fd, access, sharing, flags, options )))
+        if ((err = check_sharing( fd, access, sharing, flags, options )) ||
+            (err = check_sharing_across_servers( fd, access, sharing )))
         {
             set_error( err );
             goto error;
